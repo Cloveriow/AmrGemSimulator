@@ -1,0 +1,1082 @@
+﻿@page "/"
+
+@using System
+@using System.Collections.Generic
+@using System.Threading
+@using System.Threading.Tasks
+@implements IDisposable
+
+
+<div style="font-family: 'Segoe UI', sans-serif; text-align: center; background: #121212; color: #fff; padding: 15px;">
+    <h3>Nav2 現實模擬：SEMI E30 SECS/GEM 規範之 AMR 控制</h3>
+    
+    <!-- 工具箱選單 -->
+    <div style="margin-bottom: 12px; display: flex; justify-content: center; gap: 8px; flex-wrap: wrap;">
+        <button style="padding: 6px 12px; background: #9c27b0; color: white; border: 1px solid #ba68c8; border-radius: 4px; font-weight: bold;" @onclick="GenerateRandomRealisticMap">
+            🎲 重新生成隨機現實地圖
+        </button>
+        <button style="padding: 6px 12px; background: @(setMode == Mode.DrawObstacle ? "#00bcd4" : "#333"); color: white; border: @(setMode == Mode.DrawObstacle ? "2px solid #00ffff" : "1px solid #555"); border-radius: 4px; font-weight: bold;" @onclick="() => SetInteractionMode(Mode.DrawObstacle)">
+            ✏️ 建立障礙物
+        </button>
+        <button style="padding: 6px 12px; background: @(setMode == Mode.EraseObstacle ? "#e65100" : "#333"); color: white; border: @(setMode == Mode.EraseObstacle ? "2px solid #ff9800" : "1px solid #555"); border-radius: 4px; font-weight: bold;" @onclick="() => SetInteractionMode(Mode.EraseObstacle)">
+            🧹 橡皮擦刪除
+        </button>
+        <button style="padding: 6px 12px; background: @(setMode == Mode.SetStart ? "#28a745" : "#333"); color: white; border: @(setMode == Mode.SetStart ? "2px solid #00ff00" : "1px solid #555"); border-radius: 4px; font-weight: bold;" @onclick="() => SetInteractionMode(Mode.SetStart)">
+            📍 變更起點
+        </button>
+        <button style="padding: 6px 12px; background: @(setMode == Mode.SetGoal ? "#dc3545" : "#333"); color: white; border: @(setMode == Mode.SetGoal ? "2px solid #ff1744" : "1px solid #555"); border-radius: 4px; font-weight: bold;" @onclick="() => SetInteractionMode(Mode.SetGoal)">
+            🎯 變更終點
+        </button>
+
+
+        @if (gemProcState != GemProcessingState.EXECUTING && gemProcState != GemProcessingState.RECOVERY)
+        {
+            <button style="padding: 6px 14px; background: #28a745; color: white; border: none; border-radius: 4px; font-weight: bold;" @onclick="StartNav2Drive">
+                🚀 開始任務 (S2F41 Command)
+            </button>
+        }
+        else
+        {
+            <button style="padding: 6px 14px; background: #e91e63; color: white; border: none; border-radius: 4px; font-weight: bold;" @onclick="StopDrive">
+                ⏹ 手動急停 (EMO-Stop)
+            </button>
+        }
+
+
+        <button style="padding: 6px 12px; background: #d32f2f; color: white; border: none; border-radius: 4px;" @onclick="ClearMap">
+            🗑️ 清空全圖
+        </button>
+    </div>
+
+
+    <!-- 🌟 SECS/GEM 工業狀態儀表板 (保留車速、離終點距離與航向角) -->
+    <div style="display: flex; justify-content: center; gap: 12px; font-family: monospace; background: #1a1a1a; padding: 10px; border-radius: 6px; margin-bottom: 12px; border: 1px solid #333; flex-wrap: wrap;">
+        <div style="background:#263238; padding:5px 10px; border-radius:4px; border:1px solid #37474f;">
+            車速: <span style="color:#00ff00; font-weight:bold;">@((ekfV * 3.6).ToString("F1")) km/h</span>
+        </div>
+        <div style="background:#263238; padding:5px 10px; border-radius:4px; border:1px solid #37474f;">
+            離終點距離: <span style="color:#ff1744; font-weight:bold;">@distToFinalGoal.ToString("F1") m</span>
+        </div>
+        <div style="background:#263238; padding:5px 10px; border-radius:4px; border:1px solid #37474f;">
+            航向角 (θ): <span style="color:#e040fb; font-weight:bold;">@((ekfTheta * 180.0 / Math.PI).ToString("F1"))°</span>
+        </div>
+        <div style="background:#263238; padding:5px 10px; border-radius:4px; border:1px solid #37474f;">
+            GEM 控制狀態: <span style="color:#00ffff; font-weight:bold;">@gemControlState</span>
+        </div>
+        <div style="background:#263238; padding:5px 10px; border-radius:4px; border:1px solid #37474f;">
+            GEM 處理狀態: <span style="color:@GetProcStateColor(gemProcState); font-weight:bold;">@gemProcState</span>
+        </div>
+        <div style="background:#263238; padding:5px 10px; border-radius:4px; border:1px solid #37474f;">
+            最新 CEID: <span style="color:#ffeb3b; font-weight:bold;">@lastCEID</span>
+        </div>
+    </div>
+
+
+    <!-- 主視覺化容器 -->
+    <div style="display: flex; justify-content: center; align-items: flex-start; gap: 15px; flex-wrap: wrap;">
+        <!-- 1. 左側主視窗 -->
+        <div style="display: flex; flex-direction: column; align-items: center;">
+            <svg width="500" height="500" style="background: #000; border: @(hasCollided || isDeadlocked ? "3px solid #ff1744" : "2px solid #555"); cursor: pointer;" @onclick="OnSvgClick">
+                @for (int x = 0; x < width; x++)
+                {
+                    int lx = x;
+                    @for (int y = 0; y < height; y++)
+                    {
+                        int ly = y;
+                        byte state = knownGrid[lx, ly];
+                        if (state == 0 && !grid[lx, ly]) continue; 
+
+
+                        string cellColor = "#050505"; 
+                        if (state == 2)
+                        {
+                            cellColor = "#ff1744"; 
+                        }
+                        else if (state == 1)
+                        {
+                            double dist = esdf[lx, ly];
+                            cellColor = GetHeatmapColor(dist / maxDist); 
+                        }
+
+
+                        <rect x="@(lx * cellSize)" 
+                              y="@(ly * cellSize)" 
+                              width="@cellSize" 
+                              height="@cellSize" 
+                              fill="@cellColor" />
+                    }
+                }
+
+
+                <!-- 光達 360° 雷射射線 -->
+                @foreach (var hit in lidarHits)
+                {
+                    double carPx = ekfX * cellSize + cellSize / 2.0;
+                    double carPy = ekfY * cellSize + cellSize / 2.0;
+                    double hitPx = hit.X * cellSize;
+                    double hitPy = hit.Y * cellSize;
+
+
+                    <line x1="@carPx" y1="@carPy" x2="@hitPx" y2="@hitPy" stroke="rgba(0, 255, 255, 0.12)" stroke-width="0.6" />
+                    <circle cx="@hitPx" cy="@hitPy" r="1.2" fill="#00ffff" />
+                }
+
+
+                <!-- 平滑 Semi-A* 導航軌跡 -->
+                @if (globalPath.Count > 1)
+                {
+                    string pointsAttr = "";
+                    foreach (var p in globalPath)
+                    {
+                        double px = p.X * cellSize + cellSize / 2.0;
+                        double py = p.Y * cellSize + cellSize / 2.0;
+                        pointsAttr += $"{px},{py} ";
+                    }
+                    <polyline points="@pointsAttr" fill="none" stroke="@(isDeadlocked ? "#ff1744" : (gemProcState == GemProcessingState.RECOVERY ? "#76ff03" : "#ffeb3b"))" stroke-width="2.5" />
+                }
+
+
+                @if (isDriving && !isDeadlocked)
+                {
+                    double carPxHead = ekfX * cellSize + cellSize / 2.0;
+                    double carPyHead = ekfY * cellSize + cellSize / 2.0;
+                    double tx = targetPt.X * cellSize + cellSize / 2.0;
+                    double ty = targetPt.Y * cellSize + cellSize / 2.0;
+
+
+                    <line x1="@carPxHead" y1="@carPyHead" x2="@tx" y2="@ty" stroke="#00ffff" stroke-width="1.5" />
+                    <circle cx="@tx" cy="@ty" r="3.5" fill="#00ffff" stroke="#ffffff" stroke-width="1" />
+                }
+
+
+                <!-- 起點與終點 -->
+                <circle cx="@(startX * cellSize + cellSize / 2.0)" cy="@(startY * cellSize + cellSize / 2.0)" r="@(cellSize * 1.2)" fill="#28a745" stroke="#fff" stroke-width="1.5" />
+                <circle cx="@(goalX * cellSize + cellSize / 2.0)" cy="@(goalY * cellSize + cellSize / 2.0)" r="@(cellSize * 1.4)" fill="#dc3545" stroke="#fff" stroke-width="1.5" />
+
+
+                <!-- 車體 -->
+                @{
+                    double realPx = realX * cellSize + cellSize / 2.0;
+                    double realPy = realY * cellSize + cellSize / 2.0;
+                    double realHeadingX = realPx + Math.Cos(realTheta) * 12.0;
+                    double realHeadingY = realPy + Math.Sin(realTheta) * 12.0;
+                    string carColor = hasCollided ? "#ff0000" : (isReversing ? "#ff9800" : "#e91e63");
+                }
+                <circle cx="@realPx" cy="@realPy" r="@(cellSize * 1.0)" fill="@carColor" stroke="#ffffff" stroke-width="1.5" opacity="0.9" />
+                <line x1="@realPx" y1="@realPy" x2="@realHeadingX" y2="@realHeadingY" stroke="#ffffff" stroke-width="2" />
+            </svg>
+            <div style="font-size:0.8em; color:#aaa; margin-top:4px;">🤖 左圖：AMR SLAM 感知與 SECS/GEM 狀態監控</div>
+        </div>
+
+
+        <!-- 2. 右側視窗組 -->
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+            <!-- Scope 視錐 -->
+            <div style="width: 200px; height: 210px; border: 2px solid #00ffff; border-radius: 8px; background: rgba(0, 0, 0, 0.9); overflow: hidden; box-shadow: 0 0 15px rgba(0, 255, 255, 0.3); text-align: center;">
+                <div style="background: #00ffff; color: #000; font-size: 0.75em; font-family: monospace; font-weight: bold; padding: 3px 0;">
+                    📡 光達視錐極座標 Scope
+                </div>
+
+
+                @{
+                    double scopeSize = 200.0;
+                    double zoomRadiusInMeters = dynamicSensorRadius + 2.0;
+                    double scale = scopeSize / (zoomRadiusInMeters * 2.0);
+                    double scopeCenterX = scopeSize / 2.0;
+                    double scopeCenterY = scopeSize / 2.0;
+                }
+
+
+                <svg width="200" height="185" style="background: transparent;">
+                    @foreach (var hit in lidarHits)
+                    {
+                        double relX = (hit.X - ekfX) * scale;
+                        double relY = (hit.Y - ekfY) * scale;
+                        <circle cx="@(scopeCenterX + relX)" cy="@(scopeCenterY + relY)" r="1.5" fill="#00ffff" />
+                    }
+
+
+                    <circle cx="@scopeCenterX" cy="@scopeCenterY" r="@(dynamicSensorRadius * scale)" fill="none" stroke="#00ffff" stroke-width="1.2" stroke-dasharray="2,2" />
+
+
+                    @if (globalPath.Count > 1)
+                    {
+                        string scopePoints = "";
+                        foreach (var p in globalPath)
+                        {
+                            double relPx = (p.X - ekfX) * scale;
+                            double relPy = (p.Y - ekfY) * scale;
+                            scopePoints += $"{scopeCenterX + relPx},{scopeCenterY + relPy} ";
+                        }
+                        <polyline points="@scopePoints" fill="none" stroke="#ffeb3b" stroke-width="2" />
+                    }
+
+
+                    <circle cx="@scopeCenterX" cy="@scopeCenterY" r="5" fill="#e91e63" stroke="#ffffff" stroke-width="1.5" />
+                    @{
+                        double scopeDirX = scopeCenterX + Math.Cos(realTheta) * 14.0;
+                        double scopeDirY = scopeCenterY + Math.Sin(realTheta) * 14.0;
+                    }
+                    <line x1="@scopeCenterX" y1="@scopeCenterY" x2="@scopeDirX" y2="@scopeDirY" stroke="#ffffff" stroke-width="2" />
+                </svg>
+            </div>
+
+
+            <!-- 全圖 100x100 上帝視角 ESDF 全知地圖 -->
+            <div style="width: 200px; border: 2px solid #76ff03; border-radius: 8px; background: #000; overflow: hidden; box-shadow: 0 0 15px rgba(118, 255, 3, 0.25); text-align: center;">
+                <div style="background: #76ff03; color: #000; font-size: 0.75em; font-family: monospace; font-weight: bold; padding: 3px 0;">
+                    🌐 上帝視角真值 ESDF
+                </div>
+
+
+                <svg width="200" height="200" style="background: #000;">
+                    @for (int x = 0; x < width; x += 2)
+                    {
+                        for (int y = 0; y < height; y += 2)
+                        {
+                            string color = grid[x, y] ? "#ffffff" : GetHeatmapColor(globalEsdf[x, y] / globalMaxDist);
+
+
+                            <rect x="@(x * 2)" y="@(y * 2)" width="4" height="4" fill="@color" />
+                        }
+                    }
+
+
+                    <circle cx="@(startX * 2 + 1)" cy="@(startY * 2 + 1)" r="2.5" fill="#28a745" stroke="#fff" stroke-width="0.5" />
+                    <circle cx="@(goalX * 2 + 1)" cy="@(goalY * 2 + 1)" r="3" fill="#dc3545" stroke="#fff" stroke-width="0.5" />
+
+
+                    @{
+                        double gtPx = realX * 2.0 + 1.0;
+                        double gtPy = realY * 2.0 + 1.0;
+                        double gtDirX = gtPx + Math.Cos(realTheta) * 6.0;
+                        double gtDirY = gtPy + Math.Sin(realTheta) * 6.0;
+                    }
+                    <circle cx="@gtPx" cy="@gtPy" r="3" fill="#e91e63" stroke="#fff" stroke-width="1" />
+                    <line x1="@gtPx" y1="@gtPy" x2="@gtDirX" y2="@gtDirY" stroke="#fff" stroke-width="1" />
+                </svg>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- LOG 提示面板 -->
+    <div style="background: @(hasCollided || isDeadlocked ? "#4a0000" : "#222"); border: 1px solid @(hasCollided || isDeadlocked ? "#ff1744" : "#444"); padding: 8px; border-radius: 4px; margin-top: 8px;">
+        <p style="color: @(hasCollided || isDeadlocked ? "#ff5252" : "#aaa"); font-size: 0.9em; margin: 0; font-weight: @(hasCollided || isDeadlocked ? "bold" : "normal");">
+            @statusMessage
+        </p>
+    </div>
+</div>
+
+
+@code {
+    private const int width = 100;
+    private const int height = 100;
+    private const double cellSize = 5.0;
+
+
+    // SEMI E30 GEM 狀態機列舉定義
+    public enum GemControlState { OFFLINE, LOCAL, REMOTE }
+    public enum GemProcessingState { IDLE, EXECUTING, PAUSED, RECOVERY, COMPLETED }
+    public enum RecoverySubState { NORMAL, ESDF_CAP_SQUEEZE, ANTI_LOOP_BYPASS, REVERSE_ESCAPE }
+
+
+    private GemControlState gemControlState = GemControlState.REMOTE; 
+    private GemProcessingState gemProcState = GemProcessingState.IDLE;
+    private RecoverySubState recoverySubState = RecoverySubState.NORMAL;
+    private string lastCEID = "CEID_1001 (ControlStateChanged)";
+
+
+    private enum Mode { DrawObstacle, EraseObstacle, SetStart, SetGoal }
+    private Mode setMode = Mode.DrawObstacle;
+
+
+    private bool[,] grid = new bool[width, height];
+    private double[,] globalEsdf = new double[width, height];
+    private double globalMaxDist = 1.0;
+
+
+    private byte[,] knownGrid = new byte[width, height];
+    private double[,] esdf = new double[width, height];
+    private double maxDist = 1.0;
+
+
+    private int startX = 10, startY = 10;
+    private int goalX = 90, goalY = 90;
+    private double distToFinalGoal = 0.0;
+    
+    private double realX = 10.0, realY = 10.0, realTheta = 0.0;
+    private double realV = 0.0, realW = 0.0;
+    private double ekfX = 10.0, ekfY = 10.0, ekfTheta = 0.0, ekfV = 0.0, ekfW = 0.0;
+
+
+    private double cmdV = 0.0, cmdW = 0.0;
+    private double maxMotorV = 16.0;              
+    private double maxMotorW = 4.0;               
+
+
+    private double dynamicSensorRadius = 14.0;
+    private bool isReversing = false;
+
+
+    private double lockedPathCost = double.MaxValue;
+    private int currentPathSide = 0; 
+    private bool isPathLocked = false;
+    private int pathSwitchCount = 0;
+
+
+    private bool isDeadlocked = false;
+    private Point targetPt = new Point(90, 90);
+
+
+    private readonly Queue<int> recentPosHistory = new Queue<int>(40);
+    private readonly HashSet<int> recentPosSet = new HashSet<int>();
+
+
+    private bool hasCollided = false;
+    private bool isDriving = false;
+    private CancellationTokenSource cts;
+    
+    private readonly List<Point> lidarHits = new List<Point>(250);
+    private readonly List<Point> globalPath = new List<Point>(200);
+    private readonly List<Point> rawPathCache = new List<Point>(200);
+
+
+    private readonly double[] gScorePool = new double[width * height];
+    private readonly int[] cameFromPool = new int[width * height];
+    private readonly bool[] closedSetPool = new bool[width * height];
+    private readonly string[] colorCache = new string[241]; 
+
+
+    private Random rand = new Random();
+    private string statusMessage = "🤖 SEMI E30 SECS/GEM AMR 控制狀態機載入完成！已修復舊地圖視野殘留 Bug。";
+
+
+    public struct Point
+    {
+        public double X, Y;
+        public Point(double x, double y) { X = x; Y = y; }
+    }
+
+
+    public struct Node
+    {
+        public int Index;
+        public Point Pt;
+        public Node(int index, Point pt) { Index = index; Pt = pt; }
+    }
+
+
+    protected override void OnInitialized()
+    {
+        InitColorCache();
+        GenerateRandomRealisticMap();
+    }
+
+
+    private string GetProcStateColor(GemProcessingState state) => state switch
+    {
+        GemProcessingState.IDLE => "#00ffff",
+        GemProcessingState.EXECUTING => "#00ff00",
+        GemProcessingState.RECOVERY => "#76ff03",
+        GemProcessingState.PAUSED => "#ff9800",
+        GemProcessingState.COMPLETED => "#ff00ff",
+        _ => "#ffffff"
+    };
+
+
+    private void TriggerGEMEvent(string ceid, string description)
+    {
+        lastCEID = ceid;
+        statusMessage = $"📡 [SECS/GEM Event] {ceid}: {description}";
+    }
+
+
+    private void InitColorCache()
+    {
+        for (int i = 0; i <= 240; i++)
+        {
+            colorCache[i] = $"hsl({i}, 85%, 35%)";
+        }
+    }
+
+
+    private string GetHeatmapColor(double val)
+    {
+        val = Math.Max(0.0, Math.Min(1.0, val));
+        int hue = (int)(val * 240);
+        return colorCache[hue];
+    }
+
+
+    private void SetInteractionMode(Mode mode)
+    {
+        setMode = mode;
+        gemControlState = GemControlState.LOCAL; 
+        TriggerGEMEvent("CEID_1002 (ControlStateLocal)", $"模式切換為：【{GetModeName(mode)}】");
+    }
+
+
+    private string GetModeName(Mode mode) => mode switch
+    {
+        Mode.DrawObstacle => "✏️ 建立障礙物",
+        Mode.EraseObstacle => "🧹 橡皮擦刪除",
+        Mode.SetStart => "📍 變更起點",
+        Mode.SetGoal => "🎯 變更終點",
+        _ => "未知模式"
+    };
+
+
+    private void OnSvgClick(MouseEventArgs e)
+    {
+        int gridX = (int)Math.Clamp(e.OffsetX / cellSize, 0, width - 1);
+        int gridY = (int)Math.Clamp(e.OffsetY / cellSize, 0, height - 1);
+
+
+        OnCellClick(gridX, gridY);
+    }
+
+
+    private void OnCellClick(int x, int y)
+    {
+        switch (setMode)
+        {
+            case Mode.DrawObstacle:
+                GenerateNoisyRock(x, y, rand.Next(4, 7));
+                break;
+
+
+            case Mode.EraseObstacle:
+                for (int ex = x - 4; ex <= x + 4; ex++)
+                    for (int ey = y - 4; ey <= y + 4; ey++)
+                        if (ex >= 0 && ex < width && ey >= 0 && ey < height)
+                        {
+                            grid[ex, ey] = false;
+                            knownGrid[ex, ey] = 0; 
+                        }
+                break;
+
+
+            case Mode.SetStart:
+                if (!isDriving)
+                {
+                    startX = x; startY = y;
+                    ResetCarToStart();
+                }
+                break;
+
+
+            case Mode.SetGoal:
+                goalX = x; goalY = y;
+                break;
+        }
+
+
+        ComputeGlobalESDF();
+        SimulateLidarRaycasting();
+        ComputeESDFFromLidar();
+        RunSemiAStar(ekfX, ekfY, forceReplan: true);
+    }
+
+
+    // 🌟 Bug 核心修復：重構地圖時完全清空舊地圖的 SLAM 感知層 knownGrid 與歷史軌跡
+    private void GenerateRandomRealisticMap()
+    {
+        grid = new bool[width, height];
+        knownGrid = new byte[width, height]; // 完全分配新 0 值陣列，清空舊感測範圍
+        lidarHits.Clear();
+        globalPath.Clear();
+        recentPosHistory.Clear();
+        recentPosSet.Clear();
+
+
+        int blobCount = rand.Next(5, 8);
+        for (int i = 0; i < blobCount; i++)
+        {
+            int cx = rand.Next(20, 80);
+            int cy = rand.Next(20, 80);
+            if (Math.Abs(cx - startX) < 15 && Math.Abs(cy - startY) < 15) continue;
+            if (Math.Abs(cx - goalX) < 15 && Math.Abs(cy - goalY) < 15) continue;
+
+
+            GenerateNoisyRock(cx, cy, rand.Next(6, 12));
+        }
+
+
+        int wallCount = rand.Next(3, 6);
+        for (int i = 0; i < wallCount; i++)
+        {
+            int wx = rand.Next(15, 85);
+            int wy = rand.Next(15, 85);
+            double angle = rand.NextDouble() * Math.PI;
+            double length = rand.Next(12, 25);
+            GenerateAngledWall(wx, wy, angle, length);
+        }
+
+
+        int noisePoints = rand.Next(60, 110);
+        for (int i = 0; i < noisePoints; i++)
+        {
+            int nx = rand.Next(2, width - 2);
+            int ny = rand.Next(2, height - 2);
+            if (Math.Sqrt(Math.Pow(nx - startX, 2) + Math.Pow(ny - startY, 2)) < 8) continue;
+            if (Math.Sqrt(Math.Pow(nx - goalX, 2) + Math.Pow(ny - goalY, 2)) < 8) continue;
+
+
+            grid[nx, ny] = true;
+        }
+
+
+        ComputeGlobalESDF();
+        SimulateLidarRaycasting();
+        ComputeESDFFromLidar();
+        RunSemiAStar(ekfX, ekfY, forceReplan: true);
+        ResetCarToStart();
+
+
+        TriggerGEMEvent("CEID_2001 (MapGenerated)", "隨機不規則真實地圖生成完畢");
+    }
+
+
+    private void GenerateNoisyRock(int cx, int cy, int baseRadius)
+    {
+        double freq1 = rand.Next(3, 7);
+        double freq2 = rand.Next(7, 12);
+        double phase = rand.NextDouble() * Math.PI;
+
+
+        for (int x = cx - baseRadius - 4; x <= cx + baseRadius + 4; x++)
+        {
+            for (int y = cy - baseRadius - 4; y <= cy + baseRadius + 4; y++)
+            {
+                if (x < 0 || x >= width || y < 0 || y >= height) continue;
+                double dx = x - cx; double dy = y - cy;
+                double dist = Math.Sqrt(dx * dx + dy * dy);
+                double angle = Math.Atan2(dy, dx);
+
+
+                double noisyR = baseRadius + Math.Sin(angle * freq1 + phase) * 2.5 
+                                          + Math.Cos(angle * freq2) * 1.5 
+                                          + (rand.NextDouble() - 0.5) * 1.2;
+
+
+                if (dist <= noisyR) grid[x, y] = true;
+            }
+        }
+    }
+
+
+    private void GenerateAngledWall(int x0, int y0, double angle, double length)
+    {
+        int steps = (int)(length * 2);
+        double cosA = Math.Cos(angle);
+        double sinA = Math.Sin(angle);
+
+
+        for (int i = -steps / 2; i <= steps / 2; i++)
+        {
+            double stepDist = i * 0.5;
+            int wx = (int)Math.Round(x0 + stepDist * cosA);
+            int wy = (int)Math.Round(y0 + stepDist * sinA);
+
+
+            if (wx >= 1 && wx < width - 1 && wy >= 1 && wy < height - 1)
+            {
+                grid[wx, wy] = true;
+                if (rand.NextDouble() > 0.4) grid[wx + 1, wy] = true;
+                if (rand.NextDouble() > 0.4) grid[wx, wy + 1] = true;
+            }
+        }
+    }
+
+
+    private void ResetCarToStart()
+    {
+        realX = startX; realY = startY; realTheta = 0; realV = 0; realW = 0;
+        ekfX = startX; ekfY = startY; ekfTheta = 0; ekfV = 0; ekfW = 0;
+
+
+        cmdV = 0; cmdW = 0;
+        isReversing = false;
+        gemProcState = GemProcessingState.IDLE;
+        recoverySubState = RecoverySubState.NORMAL;
+        
+        lockedPathCost = double.MaxValue;
+        currentPathSide = 0;
+        isPathLocked = false;
+        pathSwitchCount = 0;
+        
+        recentPosHistory.Clear();
+        recentPosSet.Clear();
+
+
+        targetPt = new Point(goalX, goalY);
+        hasCollided = false;
+        isDeadlocked = false;
+    }
+
+
+    private void ComputeGlobalESDF()
+    {
+        const double INF = 1e9;
+        double[,] g = new double[width, height];
+        for (int x = 0; x < width; x++)
+            for (int y = 0; y < height; y++) g[x, y] = grid[x, y] ? 0 : INF;
+
+
+        double[] f = new double[height]; double[] dCol = new double[height];
+        for (int x = 0; x < width; x++)
+        {
+            for (int y = 0; y < height; y++) f[y] = g[x, y];
+            DT1D(f, dCol);
+            for (int y = 0; y < height; y++) g[x, y] = dCol[y];
+        }
+
+
+        f = new double[width]; double[] dRow = new double[width];
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++) f[x] = g[x, y];
+            DT1D(f, dRow);
+            for (int x = 0; x < width; x++) g[x, y] = dRow[x];
+        }
+
+
+        globalMaxDist = 1.0;
+        for (int x = 0; x < width; x++)
+            for (int y = 0; y < height; y++)
+            {
+                globalEsdf[x, y] = Math.Sqrt(g[x, y]);
+                if (globalEsdf[x, y] > globalMaxDist) globalMaxDist = globalEsdf[x, y];
+            }
+    }
+
+
+    private void SimulateLidarRaycasting()
+    {
+        lidarHits.Clear();
+        int numRays = 180;
+        double maxRange = dynamicSensorRadius;
+
+
+        for (int i = 0; i < numRays; i++)
+        {
+            double rayAngle = ekfTheta + (i / (double)numRays) * Math.PI * 2.0;
+            double dirX = Math.Cos(rayAngle); double dirY = Math.Sin(rayAngle);
+            double step = 0.4; int maxSteps = (int)(maxRange / step);
+
+
+            for (int s = 0; s < maxSteps; s++)
+            {
+                double currRayX = ekfX + dirX * (s * step);
+                double currRayY = ekfY + dirY * (s * step);
+
+
+                int gx = (int)Math.Clamp(currRayX, 0, width - 1);
+                int gy = (int)Math.Clamp(currRayY, 0, height - 1);
+
+
+                if (knownGrid[gx, gy] != 2) knownGrid[gx, gy] = 1;
+
+
+                if (grid[gx, gy])
+                {
+                    knownGrid[gx, gy] = 2; 
+                    lidarHits.Add(new Point(currRayX, currRayY));
+                    break; 
+                }
+            }
+        }
+    }
+
+
+    private void ComputeESDFFromLidar()
+    {
+        for (int x = 0; x < width; x++)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                if (knownGrid[x, y] == 2) esdf[x, y] = 0.0;
+                else
+                {
+                    double minDist = 18.0;
+                    for (int i = 0; i < lidarHits.Count; i++)
+                    {
+                        var hit = lidarHits[i];
+                        double d = Math.Sqrt((x + 0.5 - hit.X) * (x + 0.5 - hit.X) + (y + 0.5 - hit.Y) * (y + 0.5 - hit.Y));
+                        if (d < minDist) minDist = d;
+                    }
+                    esdf[x, y] = minDist;
+                }
+            }
+        }
+
+
+        maxDist = 1.0;
+        for (int x = 0; x < width; x++)
+            for (int y = 0; y < height; y++)
+                if (esdf[x, y] > maxDist) maxDist = esdf[x, y];
+    }
+
+
+    private async Task StartNav2Drive()
+    {
+        if (globalPath.Count <= 1) return;
+
+
+        isDriving = true;
+        gemProcState = GemProcessingState.EXECUTING;
+        recoverySubState = RecoverySubState.NORMAL;
+        TriggerGEMEvent("CEID_3001 (ProcessingStarted)", "接收 S2F41 Command 啟動導航任務");
+
+
+        cts = new CancellationTokenSource();
+        double dt = 0.03; 
+        int frameCounter = 0;
+
+
+        try
+        {
+            while (isDriving && !cts.Token.IsCancellationRequested)
+            {
+                frameCounter++;
+
+
+                distToFinalGoal = Math.Sqrt(Math.Pow(ekfX - goalX, 2) + Math.Pow(ekfY - goalY, 2));
+
+
+                int currentCellIdx = ((int)ekfX) * height + (int)ekfY;
+                if (!recentPosSet.Contains(currentCellIdx))
+                {
+                    recentPosSet.Add(currentCellIdx);
+                    recentPosHistory.Enqueue(currentCellIdx);
+                    if (recentPosHistory.Count > 35)
+                    {
+                        int removed = recentPosHistory.Dequeue();
+                        recentPosSet.Remove(removed);
+                    }
+                }
+
+
+                SimulateLidarRaycasting();
+                ComputeESDFFromLidar();
+                RunSemiAStar(ekfX, ekfY, forceReplan: false);
+
+
+                Point target = (globalPath.Count > 4) ? globalPath[4] : new Point(goalX, goalY);
+                targetPt = target;
+                double dx = target.X - ekfX;
+                double dy = target.Y - ekfY;
+                double targetAngle = Math.Atan2(dy, dx);
+
+
+                double angleDiff = targetAngle - ekfTheta;
+                while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI;
+                while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI;
+
+
+                double cosFactor = Math.Max(0.0, Math.Cos(angleDiff));
+                cmdV = 3.5 * (cosFactor * cosFactor);
+                cmdW = Math.Clamp(angleDiff * 4.0, -maxMotorW, maxMotorW);
+
+
+                realV += (cmdV - realV) * 0.2;
+                realW += (cmdW - realW) * 0.2;
+
+
+                realX += realV * Math.Cos(realTheta) * dt;
+                realY += realV * Math.Sin(realTheta) * dt;
+                realTheta += realW * dt;
+
+
+                while (realTheta > Math.PI) realTheta -= 2 * Math.PI;
+                while (realTheta < -Math.PI) realTheta += 2 * Math.PI;
+
+
+                ekfX = realX; ekfY = realY; ekfTheta = realTheta; ekfV = realV;
+
+
+                if (distToFinalGoal < 1.8)
+                {
+                    gemProcState = GemProcessingState.COMPLETED;
+                    recoverySubState = RecoverySubState.NORMAL;
+                    TriggerGEMEvent("CEID_3002 (ProcessingCompleted)", "精準抵達目的地，發送 S6F11 任務完成");
+                    cmdV = 0; cmdW = 0; realV = 0; realW = 0; ekfV = 0;
+                    isPathLocked = false;
+                    break;
+                }
+
+
+                if (frameCounter % 2 == 0)
+                {
+                    StateHasChanged();
+                }
+
+
+                await Task.Delay((int)(dt * 1000), cts.Token);
+            }
+        }
+        catch (TaskCanceledException) { }
+        finally
+        {
+            isDriving = false;
+            if (gemProcState != GemProcessingState.COMPLETED)
+            {
+                gemProcState = GemProcessingState.PAUSED;
+                TriggerGEMEvent("CEID_3003 (ProcessingPaused)", "導航中斷急停 (E-Stop)");
+            }
+            cmdV = 0; cmdW = 0; realV = 0; realW = 0; ekfV = 0;
+            StateHasChanged();
+        }
+    }
+
+
+    private void StopDrive()
+    {
+        cts?.Cancel();
+        isDriving = false;
+        gemProcState = GemProcessingState.PAUSED;
+        TriggerGEMEvent("CEID_3003 (ProcessingPaused)", "使用者觸發手動急停");
+    }
+
+
+    private void ClearMap()
+    {
+        grid = new bool[width, height];
+        knownGrid = new byte[width, height];
+        hasCollided = false; isDeadlocked = false; isPathLocked = false;
+        gemProcState = GemProcessingState.IDLE;
+        recoverySubState = RecoverySubState.NORMAL;
+        lockedPathCost = double.MaxValue;
+        
+        ComputeGlobalESDF();
+        SimulateLidarRaycasting();
+        ComputeESDFFromLidar();
+        RunSemiAStar(ekfX, ekfY, forceReplan: true);
+        TriggerGEMEvent("CEID_2002 (MapCleared)", "已清空地圖障礙物");
+    }
+
+
+    private void RunSemiAStar(double fromX, double fromY, bool forceReplan = false)
+    {
+        int sX = (int)Math.Clamp(fromX, 0, width - 1);
+        int sY = (int)Math.Clamp(fromY, 0, height - 1);
+        int startIdx = sX * height + sY;
+
+
+        double gDirX = goalX - fromX;
+        double gDirY = goalY - fromY;
+        double gDist = Math.Sqrt(gDirX * gDirX + gDirY * gDirY);
+        double normGDirX = (gDist > 0.001) ? gDirX / gDist : 0;
+        double normGDirY = (gDist > 0.001) ? gDirY / gDist : 0;
+
+
+        Array.Fill(gScorePool, double.MaxValue);
+        Array.Clear(closedSetPool, 0, closedSetPool.Length);
+
+
+        var openSet = new PriorityQueue<Node, double>();
+        gScorePool[startIdx] = 0;
+        openSet.Enqueue(new Node(startIdx, new Point(fromX, fromY)), 0);
+
+
+        int[] dx = { -1, 1, 0, 0, -1, -1, 1, 1 };
+        int[] dy = { 0, 0, -1, 1, -1, 1, -1, 1 };
+
+
+        bool foundPath = false;
+
+
+        while (openSet.Count > 0)
+        {
+            var currNode = openSet.Dequeue();
+            int currIdx = currNode.Index;
+            var current = currNode.Pt;
+
+
+            if (closedSetPool[currIdx]) continue;
+            closedSetPool[currIdx] = true;
+
+
+            int cx = currIdx / height;
+            int cy = currIdx % height;
+
+
+            if (Math.Sqrt(Math.Pow(current.X - goalX, 2) + Math.Pow(current.Y - goalY, 2)) < 2.0)
+            {
+                double candidateCost = gScorePool[currIdx];
+
+
+                rawPathCache.Clear();
+                int traceIdx = currIdx;
+                while (traceIdx != startIdx)
+                {
+                    int tx = traceIdx / height;
+                    int ty = traceIdx % height;
+                    rawPathCache.Add(new Point(tx, ty));
+                    traceIdx = cameFromPool[traceIdx];
+                }
+                rawPathCache.Add(new Point(fromX, fromY));
+                rawPathCache.Reverse();
+
+
+                int candidateSide = 0;
+                if (rawPathCache.Count > 4)
+                {
+                    double pX = rawPathCache[3].X - fromX;
+                    double pY = rawPathCache[3].Y - fromY;
+                    double cross = normGDirX * pY - normGDirY * pX;
+                    candidateSide = (cross >= 0) ? 1 : -1;
+                }
+
+
+                bool acceptPath = false;
+                if (forceReplan || !isPathLocked || currentPathSide == candidateSide)
+                {
+                    acceptPath = true; 
+                }
+                else if (candidateCost < lockedPathCost * 0.70) 
+                {
+                    acceptPath = true;
+                    pathSwitchCount++;
+                }
+
+
+                if (acceptPath)
+                {
+                    globalPath.Clear();
+                    globalPath.AddRange(rawPathCache);
+                    lockedPathCost = candidateCost;
+                    currentPathSide = candidateSide;
+                    isPathLocked = true;
+                }
+
+
+                foundPath = true;
+                isDeadlocked = false;
+                break;
+            }
+
+
+            for (int i = 0; i < 8; i++)
+            {
+                int nx = cx + dx[i];
+                int ny = cy + dy[i];
+
+
+                if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+                if (knownGrid[nx, ny] == 2) continue; 
+
+
+                int neighborIdx = nx * height + ny;
+                if (closedSetPool[neighborIdx]) continue;
+
+
+                double distToWall = esdf[nx, ny];
+                if (distToWall < 0.45) continue; 
+
+
+                double moveCost = (dx[i] != 0 && dy[i] != 0) ? 1.414 : 1.0;
+                
+                double rawEsdfCost = 20.0 * Math.Exp(-0.7 * distToWall);
+                double esdfCost = Math.Min(12.0, rawEsdfCost);
+
+
+                if (rawEsdfCost > 12.0 && isDriving && gemProcState != GemProcessingState.RECOVERY)
+                {
+                    gemProcState = GemProcessingState.RECOVERY;
+                    recoverySubState = RecoverySubState.ESDF_CAP_SQUEEZE;
+                    TriggerGEMEvent("CEID_4001 (PassagewaySqueezing)", "觸發狹縫代價飽和壓制，貼牆穿越");
+                }
+
+
+                double loopPenalty = 0.0;
+                if (recentPosSet.Contains(neighborIdx))
+                {
+                    loopPenalty = 150.0;
+                    if (isDriving && recoverySubState != RecoverySubState.ANTI_LOOP_BYPASS)
+                    {
+                        gemProcState = GemProcessingState.RECOVERY;
+                        recoverySubState = RecoverySubState.ANTI_LOOP_BYPASS;
+                        TriggerGEMEvent("CEID_4002 (AntiLoopTriggered)", "偵測到環形繞圈死鎖，懲罰回頭軌跡");
+                    }
+                }
+
+
+                double hysteresisPenalty = 0.0;
+                if (isPathLocked && currentPathSide != 0)
+                {
+                    double nodeVecX = nx - fromX;
+                    double nodeVecY = ny - fromY;
+                    double cross = normGDirX * nodeVecY - normGDirY * nodeVecX;
+                    int nodeSide = (cross >= 0) ? 1 : -1;
+
+
+                    if (nodeSide != currentPathSide)
+                    {
+                        hysteresisPenalty = 60.0; 
+                    }
+                }
+
+
+                double tentativeG = gScorePool[currIdx] + moveCost + esdfCost + loopPenalty + hysteresisPenalty;
+
+
+                if (tentativeG < gScorePool[neighborIdx])
+                {
+                    cameFromPool[neighborIdx] = currIdx;
+                    gScorePool[neighborKeyIdx(nx, ny)] = tentativeG;
+                    
+                    double h = Math.Sqrt(Math.Pow(nx - goalX, 2) + Math.Pow(ny - goalY, 2)) * 1.6;
+                    openSet.Enqueue(new Node(neighborIdx, new Point(nx, ny)), tentativeG + h);
+                }
+            }
+        }
+
+
+        if (!foundPath)
+        {
+            isDeadlocked = true;
+            isPathLocked = false;
+            gemProcState = GemProcessingState.PAUSED;
+            TriggerGEMEvent("ALID_1001 (NoViablePath)", "🚨 [ALARM] 無可行導航路徑，等待排除");
+        }
+    }
+
+
+    private int neighborKeyIdx(int x, int y) => x * height + y;
+
+
+    private void DT1D(double[] f, double[] d)
+    {
+        int n = f.Length;
+        int[] v = new int[n];
+        double[] z = new double[n + 1];
+        int k = 0; z[0] = -1e9; z[1] = 1e9;
+
+
+        for (int q = 1; q < n; q++)
+        {
+            double s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2.0 * q - 2.0 * v[k]);
+            while (s <= z[k]) { k--; s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2.0 * q - 2.0 * v[k]); }
+            k++; v[k] = q; z[k] = s; z[k + 1] = 1e9;
+        }
+
+
+        k = 0;
+        for (int q = 0; q < n; q++)
+        {
+            while (z[k + 1] < q) k++;
+            int dx = q - v[k];
+            d[q] = dx * dx + f[v[k]];
+        }
+    }
+
+
+    public void Dispose() 
+    { 
+        cts?.Cancel();
+        isDriving = false; 
+    }
+}
+
